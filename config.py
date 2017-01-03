@@ -61,12 +61,15 @@ from collections import OrderedDict
 run_desc                            = 'baseline'                # Name the results directory to be created for current run.
 network_type                        = 'pi'                      # Valid values: 'pi', 'tempens'.
 dataset                             = 'svhn'                    # Valid values: 'cifar-10', 'svhn'.
+aux_tinyimg                         = None                      # Valid values: None, 'c100', # for any.
 whiten_inputs                       = 'norm'                    # Valid values: None, 'norm', 'zca'.
 augment_noise_stddev                = 0.15                      # Controls the Gaussian noise added inside network during training.
 augment_mirror                      = False                     # Enable horizontal flip augmentation.
 augment_translation                 = 2                         # Maximum translation distance for augmentation. Must be an integer.
 num_labels                          = 500                       # Total number of labeled inputs (1/10th of this per class). Value 'all' uses all labels.
+corruption_percentage               = 0                         # How big percentage of input labels to corrupt.
 num_epochs                          = 300                       # Number of epochs to train.
+max_unlabeled_per_epoch             = None                      # Set this to use at most n unlabeled inputs per epoch.
 minibatch_size                      = 100                       # Samples per minibatch.
 batch_normalization_momentum        = 0.999                     # Mean-only batch normalization momentum.
 learning_rate_max                   = 0.003                     # Maximum learning rate.
@@ -131,6 +134,66 @@ random_seed                         = 1000                      # Randomization 
 #learning_rate_max               = 0.003
 #unsup_weight_max                = 30.0
 
+# CIFAR-100: Pi.
+#run_desc                        = 'run-pi'
+#network_type                    = 'pi'
+#dataset                         = 'cifar-100'
+#whiten_inputs                   = 'zca'
+#augment_mirror                  = True
+#augment_translation             = 2
+#num_labels                      = 10000
+#learning_rate_max               = 0.003
+#unsup_weight_max                = 100.0
+
+# CIFAR-100: Temporal ensembling.
+#run_desc                        = 'run-tempens'
+#network_type                    = 'tempens'
+#dataset                         = 'cifar-100'
+#whiten_inputs                   = 'zca'
+#augment_mirror                  = True
+#augment_translation             = 2
+#num_labels                      = 10000
+#learning_rate_max               = 0.003
+#unsup_weight_max                = 100.0
+
+# CIFAR-100 plus Tiny Images: Pi.
+#run_desc                        = 'run-pi'
+#network_type                    = 'pi'
+#dataset                         = 'cifar-100'
+#aux_tinyimg                     = 500000
+#whiten_inputs                   = 'zca'
+#augment_mirror                  = True
+#augment_translation             = 2
+#num_labels                      = 'all'
+#learning_rate_max               = 0.003
+#unsup_weight_max                = 300.0
+#max_unlabeled_per_epoch         = 50000
+
+# CIFAR-100 plus Tiny Images: Temporal ensembling.
+#run_desc                        = 'run-tempens'
+#network_type                    = 'tempens'
+#dataset                         = 'cifar-100'
+#aux_tinyimg                     = 500000
+#whiten_inputs                   = 'zca'
+#augment_mirror                  = True
+#augment_translation             = 2
+#num_labels                      = 'all'
+#learning_rate_max               = 0.003
+#unsup_weight_max                = 1000.0
+#max_unlabeled_per_epoch         = 50000
+
+# SVHN with label corruption: Temporal ensembling.
+#run_desc                        = 'run-tempens'
+#network_type                    = 'tempens'
+#dataset                         = 'svhn'
+#whiten_inputs                   = 'norm'
+#augment_mirror                  = False
+#augment_translation             = 2
+#num_labels                      = 'all'
+#learning_rate_max               = 0.001
+#corruption_percentage           = 20
+#unsup_weight_max                = 300.0 if (corruption_percentage < 50) else 3000.0
+
 #----------------------------------------------------------------------------
 # Disable mirror and translation augmentation.
 #----------------------------------------------------------------------------
@@ -144,6 +207,16 @@ random_seed                         = 1000                      # Randomization 
 # Automatically append dataset, label count, and random seed to run_desc.
 #----------------------------------------------------------------------------
 
+if corruption_percentage != 0:
+    run_desc += '-corrupt%d' % corruption_percentage
+
+if aux_tinyimg == 'c100':
+    run_desc += '-auxcif'
+elif aux_tinyimg == 500000:
+    run_desc += '-aux500k'
+else:
+    assert(aux_tinyimg is None)
+
 if num_labels == 'all':
     num_labels_str = 'all'
 elif (num_labels % 1000) == 0:
@@ -151,7 +224,12 @@ elif (num_labels % 1000) == 0:
 else:
     num_labels_str = '%d' % num_labels
 
-dataset_str = 'cifar' if dataset == 'cifar-10' else dataset
+if dataset == 'cifar-10':
+    dataset_str = 'cifar'
+elif dataset == 'cifar-100':
+    dataset_str = 'cifar100'
+else:
+    dataset_str = dataset
 
 run_desc = run_desc + ('_%s%s_%04d' % (dataset_str, num_labels_str, random_seed))
 

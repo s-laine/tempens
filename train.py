@@ -128,6 +128,20 @@ def load_cifar_10():
 
     return X_train, y_train, X_test, y_test
 
+def load_cifar_100():
+    import cPickle
+    def load_cifar_file(fn):
+        with open(os.path.join(config.data_dir, 'cifar-100', fn), 'rb') as f:
+            data = cPickle.load(f)
+        images = np.asarray(data['data'], dtype='float32').reshape(-1, 3, 32, 32) / np.float32(255)
+        labels = np.asarray(data['fine_labels'], dtype='int32')
+        return images, labels
+
+    X_train, y_train = load_cifar_file('train')
+    X_test, y_test = load_cifar_file('test')
+
+    return X_train, y_train, X_test, y_test
+
 def load_svhn():
     import cPickle
     def load_svhn_files(filenames):
@@ -147,12 +161,23 @@ def load_svhn():
 
     return X_train, y_train, X_test, y_test
 
+def load_tinyimages(indices, output_array=None, output_start_index=0):
+    images = output_array
+    if images is None:
+        images = np.zeros((len(indices), 3, 32, 32), dtype='float32')
+    assert(images.shape[0] >= len(indices) + output_start_index and images.shape[1:] == (3, 32, 32))
+    with open(os.path.join(config.data_dir, 'tinyimages', 'tiny_images.bin'), 'rb') as f:
+        for i, idx in enumerate(indices):
+            f.seek(3072 * idx)
+            images[output_start_index + i] = np.fromfile(f, dtype='uint8', count=3072).reshape(3, 32, 32).transpose((0, 2, 1)) / np.float32(255)
+    return images
+
 def whiten_norm(x):
     x = x - np.mean(x, axis=(1, 2, 3), keepdims=True)
     x = x / (np.mean(x ** 2, axis=(1, 2, 3), keepdims=True) ** 0.5)
     return x
 
-def prepare_dataset(result_subdir, X_train, y_train, X_test, y_test):
+def prepare_dataset(result_subdir, X_train, y_train, X_test, y_test, num_classes):
 
     # Whiten input data.
 
@@ -181,28 +206,92 @@ def prepare_dataset(result_subdir, X_train, y_train, X_test, y_test):
     X_train = X_train[indices]
     y_train = y_train[indices]
 
+    # Corrupt some of the labels if needed.
+
+    num_labels = len(y_train) if config.num_labels == 'all' else config.num_labels
+    if config.corruption_percentage > 0:
+        corrupt_labels = int(0.01 * num_labels * config.corruption_percentage)
+        corrupt_labels = min(corrupt_labels, num_labels)
+        print("Corrupting %d labels." % corrupt_labels)
+        for i in range(corrupt_labels):
+            y_train[i] = np.random.randint(0, num_classes)
+    
+    # Reshuffle.
+
+    indices = np.arange(len(X_train))
+    np.random.shuffle(indices)
+    X_train = X_train[indices]
+    y_train = y_train[indices]
+
     # Construct mask_train. It has a zero where label is unknown, and one where label is known.
 
     if config.num_labels == 'all':
         # All labels are used.
         mask_train = np.ones(len(y_train), dtype=np.float32)
+        print("Keeping all labels.")
     else:
         # Assign labels to a subset of inputs.
-        max_count = config.num_labels // 10
+        num_img = min(num_classes, 20)
+        max_count = config.num_labels // num_classes
+        print("Keeping %d labels per class." % max_count)
         img_count = min(max_count, 32)
-        label_image = np.zeros((X_train.shape[1], 32 * 10, 32 * img_count))
+        label_image = np.zeros((X_train.shape[1], 32 * num_img, 32 * img_count))
         mask_train = np.zeros(len(y_train), dtype=np.float32)
-        count = [0] * 10
+        count = [0] * num_classes
         for i in range(len(y_train)):
             label = y_train[i]
             if count[label] < max_count:
                 mask_train[i] = 1.0
-                if count[label] < img_count:
+                if count[label] < img_count and label < num_img:
                     label_image[:, label * 32 : (label + 1) * 32, count[label] * 32 : (count[label] + 1) * 32] = X_train[i, :, p:p+32, p:p+32]
             count[label] += 1
 
         # Dump out some of the labeled digits.
         save_image(os.path.join(result_subdir, 'labeled_inputs.png'), label_image)
+
+    # Draw in auxiliary data from the tiny images dataset.
+
+    if config.aux_tinyimg is not None:
+        print("Augmenting with unlabeled data from tiny images dataset.")
+        with open(os.path.join(config.data_dir, 'tinyimages', 'tiny_index.pkl'), 'rb') as f:
+            tinyimg_index = pickle.load(f)
+
+        if config.aux_tinyimg == 'c100':
+            print("Using all classes common with CIFAR-100.")
+
+            with open(os.path.join(config.data_dir, 'cifar-100', 'meta'), 'rb') as f:
+                cifar_labels = pickle.load(f)['fine_label_names']
+            cifar_to_tinyimg = { 'maple_tree': 'maple', 'aquarium_fish' : 'fish' }
+            cifar_labels = [l if l not in cifar_to_tinyimg else cifar_to_tinyimg[l] for l in cifar_labels]
+
+            load_indices = sum([list(range(*tinyimg_index[label])) for label in cifar_labels], [])
+        else:
+            print("Using %d random images." % config.aux_tinyimg)
+
+            num_all_images = max(e for s, e in tinyimg_index.values())
+            load_indices = np.arange(num_all_images)
+            np.random.shuffle(load_indices)
+            load_indices = load_indices[:config.aux_tinyimg]
+            load_indices.sort() # Some coherence in seeks.
+
+        # Load the images.
+
+        num_aux_images = len(load_indices)
+        print("Loading %d auxiliary unlabeled images." % num_aux_images)
+        Z_train = load_tinyimages(load_indices)
+
+        # Whiten and pad.
+
+        if config.whiten_inputs == 'norm':
+            Z_train = whiten_norm(Z_train)
+        elif config.whiten_inputs == 'zca':
+            Z_train = whitener.apply(Z_train)
+        Z_train = np.pad(Z_train, ((0, 0), (0, 0), (p, p), (p, p)), 'reflect')
+
+        # Concatenate to training data and append zeros to labels and mask.
+        X_train = np.concatenate((X_train, Z_train))
+        y_train = np.concatenate((y_train, np.zeros(num_aux_images, dtype='int32')))
+        mask_train = np.concatenate((mask_train, np.zeros(num_aux_images, dtype='float32')))
 
     # Zero out masked-out labels for maximum paranoia.
     for i in range(len(y_train)):
@@ -210,7 +299,6 @@ def prepare_dataset(result_subdir, X_train, y_train, X_test, y_test):
             y_train[i] = 0
 
     return X_train, y_train, mask_train, X_test, y_test
-
 
 ###################################################################################################
 # Network I/O.
@@ -251,7 +339,7 @@ from lasagne.utils import floatX
 from zca_bn import ZCA
 from zca_bn import mean_only_bn as WN
 
-def build_network(input_var, num_input_channels):
+def build_network(input_var, num_input_channels, num_classes):
     conv_defs = {
         'W': lasagne.init.HeNormal('relu'),
         'b': lasagne.init.Constant(0.0),
@@ -292,7 +380,7 @@ def build_network(input_var, num_input_channels):
     net = WN(NINLayer       (net, name='conv3b',   num_units=256,               **nin_defs),  **wn_defs)
     net = WN(NINLayer       (net, name='conv3c',   num_units=128,               **nin_defs),  **wn_defs)
     net = GlobalPoolLayer   (net, name='pool3')    
-    net = WN(DenseLayer     (net, name='dense',    num_units=10,                **dense_defs), **wn_defs)
+    net = WN(DenseLayer     (net, name='dense',    num_units=num_classes,       **dense_defs), **wn_defs)
 
     return net
 
@@ -352,10 +440,21 @@ def iterate_minibatches(inputs, targets, batch_size):
 
 def iterate_minibatches_augment_pi(inputs, labels, mask, batch_size):
     assert len(inputs) == len(labels) == len(mask)
-    num = len(inputs)
-    indices = np.arange(num) 
     crop = config.augment_translation
+    
+    num = len(inputs)
+    if config.max_unlabeled_per_epoch is None:
+        indices = np.arange(num)
+    else:        
+        labeled_indices   = [i for i in range(num) if mask[i] > 0.0]
+        unlabeled_indices = [i for i in range(num) if mask[i] == 0.0]
+        np.random.shuffle(unlabeled_indices)
+        indices = labeled_indices + unlabeled_indices[:config.max_unlabeled_per_epoch] # Limit the number of unlabeled inputs per epoch.
+        indices = np.asarray(indices)
+        num = len(indices)
+
     np.random.shuffle(indices)
+
     for start_idx in range(0, num, batch_size):
         if start_idx + batch_size <= num:
             excerpt = indices[start_idx : start_idx + batch_size]
@@ -376,10 +475,21 @@ def iterate_minibatches_augment_pi(inputs, labels, mask, batch_size):
 
 def iterate_minibatches_augment_tempens(inputs, labels, mask, targets, batch_size):
     assert len(inputs) == len(labels) == len(mask) == len(targets)
-    num = len(inputs)
-    indices = np.arange(num) 
     crop = config.augment_translation
+
+    num = len(inputs)
+    if config.max_unlabeled_per_epoch is None:
+        indices = np.arange(num)
+    else:        
+        labeled_indices   = [i for i in range(num) if mask[i] > 0.0]
+        unlabeled_indices = [i for i in range(num) if mask[i] == 0.0]
+        np.random.shuffle(unlabeled_indices)
+        indices = labeled_indices + unlabeled_indices[:config.max_unlabeled_per_epoch] # Limit the number of unlabeled inputs per epoch.
+        indices = np.asarray(indices)
+        num = len(indices)
+
     np.random.shuffle(indices)
+
     for start_idx in range(0, num, batch_size):
         if start_idx + batch_size <= num:
             excerpt = indices[start_idx : start_idx + batch_size]
@@ -430,22 +540,31 @@ def run_training(monitor_filename=None):
     report.export_run_details(os.path.join(result_subdir, 'run.txt'))
     report.export_config(os.path.join(result_subdir, 'config.txt'))
 
-    # Load and prepare the dataset.
+    # Load the dataset.
 
     print("Loading dataset '%s'..." % config.dataset)
 
     if config.dataset == 'cifar-10':
         X_train, y_train, X_test, y_test = load_cifar_10()
+    elif config.dataset == 'cifar-100':
+        X_train, y_train, X_test, y_test = load_cifar_100()
     elif config.dataset == 'svhn':
         X_train, y_train, X_test, y_test = load_svhn()
     else:
         print("Unknown dataset '%s'." % config.dataset)
         exit()
 
-    # Print dataset stats.
+    # Calculate number of classes.
 
-    X_train, y_train, mask_train, X_test, y_test = prepare_dataset(result_subdir, X_train, y_train, X_test, y_test)
-    print("Got %d inputs, out of which %d are labeled." % (len(X_train), sum(mask_train)))
+    num_classes = len(set(y_train))
+    assert(set(y_train) == set(y_test) == set(range(num_classes))) # Check that all labels are in range [0, num_classes-1]
+    print("Found %d classes in training set, %d in test set." % (len(set(y_train)), len(set(y_test))))
+
+    # Prepare dataset and print stats.
+
+    X_train, y_train, mask_train, X_test, y_test = prepare_dataset(result_subdir, X_train, y_train, X_test, y_test, num_classes)
+    print("Got %d training inputs, out of which %d are labeled." % (len(X_train), sum(mask_train)))
+    print("Got %d test inputs." % len(X_test))
 
     #----------------------------------------------------------------------------
     # Prepare to train.
@@ -484,7 +603,7 @@ def run_training(monitor_filename=None):
             input_vars.append(input_b_var)
     else:
         print("Building network and compiling functions...")
-        net = build_network(input_var, X_train.shape[1])
+        net = build_network(input_var, X_train.shape[1], num_classes)
 
     # Export topology report.
 
@@ -543,14 +662,17 @@ def run_training(monitor_filename=None):
 
     print("Starting training.")
 
+    if config.max_unlabeled_per_epoch is not None:
+        print("Limiting number of unlabeled inputs per epoch to %d." % config.max_unlabeled_per_epoch)
+
     training_csv = report.GenericCSV(os.path.join(result_subdir, 'training.csv'),
         'Epoch', 'EpochTime', 'TrainLoss', 'TestLoss', 'TestAccuracy', 'LearningRate')
 
     # Initial training variables for temporal ensembling.
 
     if config.network_type == 'tempens':
-        ensemble_prediction = np.zeros((len(X_train), 10))
-        training_targets = np.zeros((len(X_train), 10))
+        ensemble_prediction = np.zeros((len(X_train), num_classes))
+        training_targets = np.zeros((len(X_train), num_classes))
 
     #----------------------------------------------------------------------------
     # Training loop.
@@ -585,7 +707,8 @@ def run_training(monitor_filename=None):
         # Initialize epoch predictions for temporal ensembling.
 
         if config.network_type == 'tempens':
-            epoch_predictions = np.zeros((len(X_train), 10))
+            epoch_predictions = np.zeros((len(X_train), num_classes))
+            epoch_execmask = np.zeros(len(X_train)) # Which inputs were executed.
             training_targets = floatX(training_targets)
 
         # Training pass.
@@ -614,6 +737,7 @@ def run_training(monitor_filename=None):
                     (e_train, prediction) = train_fn(inputs, labels, mask, targets, floatX(learning_rate), floatX(adam_beta1), floatX(unsup_weight))
                     for i, j in enumerate(indices):
                         epoch_predictions[j] = prediction[i] # Gather epoch predictions.
+                        epoch_execmask[j] = 1.0
                     train_err += e_train * n
                     train_n += n
 
@@ -630,8 +754,15 @@ def run_training(monitor_filename=None):
                 val_n += n
 
         if config.network_type == 'tempens':
-            ensemble_prediction = (config.prediction_decay * ensemble_prediction) + (1.0 - config.prediction_decay) * epoch_predictions
-            training_targets = ensemble_prediction / (1.0 - config.prediction_decay ** ((epoch - config.start_epoch) + 1.0))
+            if config.max_unlabeled_per_epoch is None:
+                # Basic mode.
+                ensemble_prediction = (config.prediction_decay * ensemble_prediction) + (1.0 - config.prediction_decay) * epoch_predictions
+                training_targets = ensemble_prediction / (1.0 - config.prediction_decay ** ((epoch - config.start_epoch) + 1.0))
+            else:
+                # Sparse updates.
+                epoch_execmask = epoch_execmask.reshape(-1, 1)
+                ensemble_prediction = epoch_execmask * (config.prediction_decay * ensemble_prediction + (1.0 - config.prediction_decay) * epoch_predictions) + (1.0 - epoch_execmask) * ensemble_prediction
+                training_targets = ensemble_prediction / (np.sum(ensemble_prediction, axis=1, keepdims=True) + 1e-8) # Normalize
 
         # Export stats.
 
